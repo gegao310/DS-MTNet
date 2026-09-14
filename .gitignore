@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 数据与生成产物
+extracted_features/
+extracted_features1/
+nasa_features/
+XJTU_dataset/
+NASA_dataset/
+Results_*/
+Alert_*/
+predictions/
+*.pkl
+*.csv
+*.mat
+
+# 可视化输出
+*.png
+*.jpg
+*.pdf
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
