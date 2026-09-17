@@ -17,6 +17,7 @@ The two streams are fused by an adaptive gated fusion module and followed by tas
 
 ```
 .
+├── feature_schema.py         # Unified 14-D cycle-level feature schema (paper Table 1)
 ├── XJTU_processing.py        # XJTU dataset: cycle-level feature extraction -> .pkl
 ├── NASA_dataprocessing.py    # NASA dataset: cycle-level feature extraction -> .pkl
 ├── XJTU_experiment.py        # Main experiments (Exp1-Exp4): benchmark, ablation, transfer
@@ -24,6 +25,36 @@ The two streams are fused by an adaptive gated fusion module and followed by tas
 ├── battery_alert.py          # Hierarchical early warning analysis (Algorithm 1)
 └── requirements.txt
 ```
+
+## Unified 14-D Feature Vector
+
+Both datasets are mapped onto a **single 14-dimensional cycle-level feature vector**
+(`F = 14`), so that network weights can be transferred across datasets. The schema is
+defined once in `feature_schema.py` and imported by both extraction scripts; column
+names, order and units match **Table 1** of the paper.
+
+| Phase | Feature | Symbol | Unit | XJTU | NASA |
+|---|---|---|---|---|---|
+| CC charge | Constant-current duration | `t_CC` | min | measured | zero-padded |
+| CC charge | Constant-current input energy | `E_CC` | Wh | measured | zero-padded |
+| CC charge | Rate of voltage change | `dVdt` | V/min | measured | zero-padded |
+| CC charge | Shannon entropy of voltage | `H_V_CC` | bits | measured | zero-padded |
+| CV charge | Constant-voltage input capacity | `Q_CV` | Ah | measured | zero-padded |
+| CV charge | Constant-voltage input energy | `E_CV` | Wh | measured | zero-padded |
+| CV charge | Shannon entropy of current | `H_I_CV` | bits | measured | zero-padded |
+| Discharge | Discharge capacity | `Q_dis` | Ah | measured | measured |
+| Discharge | Discharge energy | `E_dis` | Wh | measured | measured |
+| Discharge | Mean discharge current | `I_dis_mean` | A | measured | measured |
+| Discharge | Mean discharge voltage | `V_dis_mean` | V | measured | measured |
+| Discharge | Minimum discharge voltage | `V_dis_min` | V | measured | measured |
+| Discharge | Std. of discharge voltage | `V_dis_std` | V | measured | measured |
+| Discharge | Discharge voltage decay slope | `k_V_dis` | V/step | measured | measured |
+
+Energy / capacity are obtained by numerical integration; integration time is converted
+to hours, so that `int(V*I dt)` is directly in Wh and `int(I dt)` in Ah. Because the
+NASA dataset contains only discharge cycles, its seven charge-phase channels are filled
+with zeros. If you edit one extraction script, keep the other in sync via
+`feature_schema.py` — a mismatch raises a `ValueError` at run time.
 
 ## Environment
 
@@ -55,8 +86,9 @@ configuration at the top of each script.
 python XJTU_processing.py --base_path /path/to/XJTU_dataset --output_dir ./extracted_features
 ```
 
-This produces `unified_Batch-{1..4}.pkl`, each containing cycle-level features and the
-`Target_T_max` / `Target_T_mean` / `Target_SOH` labels.
+This produces `unified_Batch-{1..4}.pkl`. Each file contains `battery_id`,
+`cycle_count`, the **14-D** unified feature vector described above, and the
+`Target_T_max` / `Target_T_mean` / `Target_T_rise` / `Target_SOH` labels.
 
 ### NASA
 
@@ -67,7 +99,9 @@ Edit `RAW_DATA_DIR` / `OUT_FEATURE_DIR` in `NASA_dataprocessing.py` (or call
 python NASA_dataprocessing.py
 ```
 
-This produces `B0005_features.pkl`, ..., and a `battery_overview.csv`.
+This produces `B0005_features.pkl`, ..., and a `battery_overview.csv`. Each pickle
+carries the same **14-D** unified feature vector (7 measured discharge channels +
+7 zero-padded charge channels), so it can be fed to the XJTU-trained model directly.
 
 ## Running Experiments
 

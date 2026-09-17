@@ -1,9 +1,16 @@
 """
 XJTU电池统一特征提取 (双标签版本)
 同时提取:
-  输入特征: 充电特征(原有) + 放电特征(新增) 共约28维
+  输入特征: 统一 14 维循环级特征（严格对应论文 Table 1）
+            └ 充电阶段 7 维: CC 4 维 (t_CC, E_CC, dVdt, H_V_CC)
+                           + CV 3 维 (Q_CV, E_CV, H_I_CV)
+            └ 放电阶段 7 维: Q_dis, E_dis, I_dis_mean,
+                           V_dis_mean, V_dis_min, V_dis_std, k_V_dis
   标签1: Target_T_max  (温度预测)
   标签2: Target_SOH    (SOH预测, 为后续联合预测准备)
+
+列名与顺序由 feature_schema.py 统一定义（与 NASA 脚本共用），
+保证跨域迁移时两侧特征维度一致 (F = 14)。
 
 修复: Dynamic域(Batch-3/4)加入放电倍率信息
       解决原版只有充电特征导致Dynamic域预测失效的问题
@@ -18,6 +25,11 @@ from scipy.io import loadmat
 from scipy.stats import skew
 import warnings
 from tqdm import tqdm
+
+from feature_schema import (
+    CHARGE_FEATURES, DISCHARGE_FEATURES, FEATURE_NAMES,
+    N_FEATURES, FEATURE_UNITS, check_feature_order,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -55,37 +67,22 @@ class UnifiedBatteryExtractor:
 
     def _extract_charge_features(self, time, v, i, t):
         """
-        充电阶段特征提取 (保留原有逻辑不变)
+        充电阶段特征提取
         输入: 充电段的 time/v/i/t
-        输出: dict, 约16维
+        输出: dict, 固定 7 维 (CC 4 维 + CV 3 维)，对应论文 Table 1
+
+        单位约定: 原始 relative_time_min 单位为 min，
+                  积分时除以 60 转为 h，故
+                  ∫V·I dt → Wh, ∫I dt → Ah
         """
         feats = {}
 
         if len(time) < 2:
-            # 返回全零占位
-            keys = [
-                'Charge_energy','Charge_Q',
-                'Charge_V_mean','Charge_V_std','Charge_V_skew',
-                'Charge_I_mean','Charge_I_std','Charge_I_skew',
-                'CC_energy','CC_Q','CC_Time','CC_V_Entropy',
-                'CV_energy','CV_Q','CV_I_Entropy','dV_dt'
-            ]
-            return {k: 0.0 for k in keys}
+            # 数据不足：返回全零占位
+            return {k: 0.0 for k in CHARGE_FEATURES}
 
-        dt      = (time - time[0]) / 60.0
+        dt      = (time - time[0]) / 60.0   # min -> h
         power   = v * i
-
-        # 全充电段统计
-        feats['Charge_energy'] = float(np.trapz(power, dt))
-        feats['Charge_Q']      = float(np.trapz(i, dt))
-        feats['Charge_V_mean'] = float(np.mean(v))
-        feats['Charge_V_std']  = float(np.std(v))
-        feats['Charge_V_skew'] = self._safe_skew(v)
-        feats['Charge_I_mean'] = float(np.mean(i))
-        feats['Charge_I_std']  = float(np.std(i))
-        feats['Charge_I_skew'] = self._safe_skew(i)
-
-        # CC/CV 阶段分割
         cv_start  = np.where(v >= 4.199)[0]
         split_idx = cv_start[0] if len(cv_start) > 0 \
                     else np.argmax(v)
@@ -98,19 +95,18 @@ class UnifiedBatteryExtractor:
         v_cv    = v[split_idx:]
         i_cv    = i[split_idx:]
 
-        # CC段特征
+        # CC段特征 (4 维)
         if len(time_cc) > 1:
-            dt_cc = (time_cc - time_cc[0]) / 60.0
-            feats['CC_energy'] = float(
-                np.trapz(v_cc * i_cc, dt_cc)
+            dt_cc = (time_cc - time_cc[0]) / 60.0      # min -> h
+            feats['E_CC'] = float(
+                np.trapz(v_cc * i_cc, dt_cc)           # Wh
             )
-            feats['CC_Q']    = float(np.trapz(i_cc, dt_cc))
-            feats['CC_Time'] = float(
-                time_cc[-1] - time_cc[0]
+            feats['t_CC'] = float(
+                time_cc[-1] - time_cc[0]               # min
             )
-            feats['CC_V_Entropy'] = self._calc_entropy(v_cc)
+            feats['H_V_CC'] = self._calc_entropy(v_cc)
 
-            # dV/dt (极化特征)
+            # dV/dt (极化特征)  [V/min]
             idx_dv = np.where(
                 (v_cc >= self.v_cc_start) &
                 (v_cc <= self.v_cc_end)
@@ -120,43 +116,44 @@ class UnifiedBatteryExtractor:
                     time_cc[idx_dv[-1]] -
                     time_cc[idx_dv[0]]
                 )
-                feats['dV_dt'] = float(
+                feats['dVdt'] = float(
                     (v_cc[idx_dv[-1]] - v_cc[idx_dv[0]]) /
                     (dt_seg + 1e-8)
                 )
             else:
-                feats['dV_dt'] = 0.0
+                feats['dVdt'] = 0.0
         else:
             feats.update({
-                'CC_energy': 0.0, 'CC_Q': 0.0,
-                'CC_Time': 0.0, 'CC_V_Entropy': 0.0,
-                'dV_dt': 0.0
+                'E_CC': 0.0, 't_CC': 0.0,
+                'H_V_CC': 0.0, 'dVdt': 0.0
             })
 
-        # CV段特征
+        # CV段特征 (3 维)
         if len(time_cv) > 5:
-            dt_cv = (time_cv - time_cv[0]) / 60.0
-            feats['CV_energy'] = float(
-                np.trapz(v_cv * i_cv, dt_cv)
+            dt_cv = (time_cv - time_cv[0]) / 60.0      # min -> h
+            feats['E_CV'] = float(
+                np.trapz(v_cv * i_cv, dt_cv)           # Wh
             )
-            feats['CV_Q']         = float(
-                np.trapz(i_cv, dt_cv)
+            feats['Q_CV']    = float(
+                np.trapz(i_cv, dt_cv)                  # Ah
             )
-            feats['CV_I_Entropy'] = self._calc_entropy(i_cv)
+            feats['H_I_CV'] = self._calc_entropy(i_cv)
         else:
             feats.update({
-                'CV_energy': 0.0,
-                'CV_Q': 0.0,
-                'CV_I_Entropy': 0.0
+                'E_CV': 0.0,
+                'Q_CV': 0.0,
+                'H_I_CV': 0.0
             })
 
-        return feats
+        # 保证 7 个键齐全且顺序固定
+        return {k: float(feats.get(k, 0.0))
+                for k in CHARGE_FEATURES}
 
     def _extract_discharge_features(self, time, v, i, t):
         """
-        放电阶段特征提取 (新增)
+        放电阶段特征提取
         输入: 放电段的 time/v/i/t (i为负值)
-        输出: dict, 约12维
+        输出: dict, 固定 7 维，对应论文 Table 1 的放电阶段
 
         关键: 放电倍率信息在这里
         → 修复Dynamic域预测失效的核心
@@ -167,49 +164,35 @@ class UnifiedBatteryExtractor:
         i_abs = np.abs(i)
 
         if len(time) < 2:
-            keys = [
-                'Dis_Q', 'Dis_Energy',
-                'Dis_I_mean', 'Dis_I_max', 'Dis_I_std',
-                'Dis_V_mean', 'Dis_V_min', 'Dis_V_std',
-                'Dis_Time', 'Dis_V_Entropy',
-                'Dis_I_skew', 'Dis_V_slope'
-            ]
-            return {k: 0.0 for k in keys}
+            return {k: 0.0 for k in DISCHARGE_FEATURES}
 
-        dt    = (time - time[0]) / 60.0
+        dt    = (time - time[0]) / 60.0     # min -> h
         power = v * i_abs
 
-        # 容量和能量
-        feats['Dis_Q']      = float(np.trapz(i_abs, dt))
-        feats['Dis_Energy'] = float(np.trapz(power,  dt))
+        # 容量 [Ah] 与能量 [Wh]
+        feats['Q_dis'] = float(np.trapz(i_abs, dt))
+        feats['E_dis'] = float(np.trapz(power,  dt))
 
-        # 电流统计 (反映放电倍率)
-        feats['Dis_I_mean'] = float(np.mean(i_abs))
-        feats['Dis_I_max']  = float(np.max(i_abs))
-        feats['Dis_I_std']  = float(np.std(i_abs))
-        feats['Dis_I_skew'] = self._safe_skew(i_abs)
+        # 电流统计 (反映放电倍率) [A]
+        feats['I_dis_mean'] = float(np.mean(i_abs))
 
-        # 电压统计 (反映内阻和极化)
-        feats['Dis_V_mean'] = float(np.mean(v))
-        feats['Dis_V_min']  = float(np.min(v))
-        feats['Dis_V_std']  = float(np.std(v))
+        # 电压统计 (反映内阻和极化) [V]
+        feats['V_dis_mean'] = float(np.mean(v))
+        feats['V_dis_min']  = float(np.min(v))
+        feats['V_dis_std']  = float(np.std(v))
 
-        # 放电时长
-        feats['Dis_Time'] = float(time[-1] - time[0])
-
-        # 电压熵 (反映放电曲线形态)
-        feats['Dis_V_Entropy'] = self._calc_entropy(v)
-
-        # 电压下降斜率 (反映老化程度)
+        # 电压下降斜率 (反映老化程度) [V/step]
         if len(v) > 5:
             x = np.linspace(0, 1, len(v))
-            feats['Dis_V_slope'] = float(
+            feats['k_V_dis'] = float(
                 np.polyfit(x, v, 1)[0]
             )
         else:
-            feats['Dis_V_slope'] = 0.0
+            feats['k_V_dis'] = 0.0
 
-        return feats
+        # 保证 7 个键齐全且顺序固定
+        return {k: float(feats.get(k, 0.0))
+                for k in DISCHARGE_FEATURES}
 
     def _extract_temp_labels(self, t_charge, t_discharge):
         """
@@ -239,8 +222,8 @@ class UnifiedBatteryExtractor:
 
         返回: dict 或 None (数据不足时)
         包含:
-          充电特征 (~16维)
-          放电特征 (~12维)
+          充电特征 (7维: CC 4 + CV 3)
+          放电特征 (7维)
           温度标签 (3个)
           放电容量 (用于SOH计算)
         """
@@ -308,7 +291,7 @@ class UnifiedBatteryExtractor:
         result.update(temp_labels)
 
         # 4. 放电容量 (SOH计算用, 单独保存)
-        result['_raw_Dis_Q'] = result['Dis_Q']
+        result['_raw_Q_dis'] = result['Q_dis']
 
         return result
 
@@ -388,7 +371,7 @@ def process_batch(batch_root, batch_name,
             # ── SOH计算 ──────────────────────────────
             # 用第一个有效循环的放电容量作为额定容量
             q_values = np.array(
-                [r['_raw_Dis_Q'] for r in battery_records]
+                [r['_raw_Q_dis'] for r in battery_records]
             )
 
             # 找第一个非零放电容量
@@ -401,7 +384,7 @@ def process_batch(batch_root, batch_name,
             q_nominal = valid_q[0]  # 第一个有效循环的容量
 
             for r in battery_records:
-                q = r['_raw_Dis_Q']
+                q = r['_raw_Q_dis']
                 if q > 0.01:
                     r['Target_SOH'] = float(
                         min(q / q_nominal, 1.05)
@@ -412,7 +395,7 @@ def process_batch(batch_root, batch_name,
                     r['Target_SOH'] = 1.0
 
                 # 清理临时字段
-                del r['_raw_Dis_Q']
+                del r['_raw_Q_dis']
 
             all_records.extend(battery_records)
 
@@ -436,8 +419,10 @@ def process_batch(batch_root, batch_name,
     id_cols    = ['battery_id', 'cycle_count']
     label_cols = ['Target_T_max', 'Target_T_mean',
                   'Target_T_rise', 'Target_SOH']
-    feat_cols  = [c for c in df.columns
+    raw_feats  = [c for c in df.columns
                   if c not in id_cols + label_cols]
+    # 按论文 Table 1 的 14 维顺序对齐，缺列/多列会直接报错
+    feat_cols  = check_feature_order(raw_feats)
 
     df = df[id_cols + feat_cols + label_cols]
 
@@ -456,8 +441,10 @@ def process_batch(batch_root, batch_name,
     print(f"\n  {batch_name} 汇总:")
     print(f"    电池数:    {n_bats}")
     print(f"    总循环数:  {len(df)}")
-    print(f"    特征维度:  {len(feat_cols)}")
-    print(f"    特征列表:  {feat_cols}")
+    print(f"    特征维度:  {len(feat_cols)} "
+          f"(须等于统一特征表 {N_FEATURES} 维)")
+    for c in feat_cols:
+        print(f"      - {c:12s} [{FEATURE_UNITS.get(c, '-')}]")
     print(f"    T_max范围: "
           f"[{df['Target_T_max'].min():.1f}, "
           f"{df['Target_T_max'].max():.1f}]℃")
@@ -485,7 +472,7 @@ def validate_extraction(df, batch_name):
         soh_start = group['Target_SOH'].iloc[0]
         soh_end   = group['Target_SOH'].iloc[-1]
         t_mean    = group['Target_T_max'].mean()
-        dis_i     = group['Dis_I_mean'].mean()
+        dis_i     = group['I_dis_mean'].mean()
         n_cycles  = len(group)
 
         print(f"  {bat_id:35s} "
@@ -497,12 +484,12 @@ def validate_extraction(df, batch_name):
     # 检查Dynamic域的放电电流变化
     if 'Batch-3' in batch_name or 'Batch-4' in batch_name:
         print(f"\n  Dynamic域放电电流分布:")
-        print(f"    Dis_I_mean: "
-              f"[{df['Dis_I_mean'].min():.3f}, "
-              f"{df['Dis_I_mean'].max():.3f}] A")
-        print(f"    Dis_I_max:  "
-              f"[{df['Dis_I_max'].min():.3f}, "
-              f"{df['Dis_I_max'].max():.3f}] A")
+        print(f"    I_dis_mean: "
+              f"[{df['I_dis_mean'].min():.3f}, "
+              f"{df['I_dis_mean'].max():.3f}] A")
+        print(f"    V_dis_min:  "
+              f"[{df['V_dis_min'].min():.3f}, "
+              f"{df['V_dis_min'].max():.3f}] V")
         print(f"  → 如果范围够宽(如0.5~5A), 说明放电特征提取成功")
 
 
@@ -575,13 +562,14 @@ def main():
             print(f"    unified_{b_name}.pkl  "
                   f"{size:.1f} KB")
 
-    print(f"\n  特征列说明:")
-    print(f"    充电特征(16维): CC_*/CV_*/Charge_*/dV_dt")
-    print(f"    放电特征(12维): Dis_Q/Energy/I_*/V_*  "
-          f"← Dynamic域修复关键")
-    print(f"    温度标签:       Target_T_max (主要使用)")
-    print(f"    SOH标签:        Target_SOH   "
-          f"(为后续联合预测准备)")
+    print(f"\n  统一特征列说明 "
+          f"(共 {N_FEATURES} 维, 与论文 Table 1 一致):")
+    print(f"    CC 充电(4维): t_CC / E_CC / dVdt / H_V_CC")
+    print(f"    CV 充电(3维): Q_CV / E_CV / H_I_CV")
+    print(f"    放电(7维)  : Q_dis / E_dis / I_dis_mean / "
+          f"V_dis_mean / V_dis_min / V_dis_std / k_V_dis")
+    print(f"    温度标签    : Target_T_max (主要使用)")
+    print(f"    SOH标签     : Target_SOH (为后续联合预测准备)")
 
 
 if __name__ == "__main__":

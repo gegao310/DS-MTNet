@@ -8,6 +8,12 @@ from scipy.io import loadmat
 from scipy.stats import linregress
 from scipy.interpolate import interp1d
 
+from feature_schema import (
+    CHARGE_FEATURES, DISCHARGE_FEATURES, FEATURE_NAMES,
+    N_FEATURES, FEATURE_UNITS, empty_charge_features,
+    check_feature_order,
+)
+
 warnings.filterwarnings("ignore")
 
 
@@ -17,6 +23,11 @@ warnings.filterwarnings("ignore")
 # 开源版：请按需修改为你本地 NASA 数据集的路径，或通过命令行参数覆盖
 RAW_DATA_DIR = "./NASA_dataset"     # NASA 原始 .mat 文件目录
 OUT_FEATURE_DIR = "./nasa_features"  # 提取后的特征输出目录
+
+# ── 统一 14 维特征表（与 XJTU_processing.py / 论文 Table 1 共用）──
+# NASA 数据集只有放电循环记录，没有 CC / CV 充电阶段的原始数据，
+# 因此 7 个充电阶段特征按论文所述用 0 填充（zero-padding），
+# 以保证与 XJTU 侧的特征维度一致（F = 14），支持跨域权重迁移。
 
 # 先用这4个经典电池做验证，和你前面的设计保持一致
 BATTERIES = BATTERIES = [
@@ -197,83 +208,55 @@ def interp_y_at_x(x, y, xq):
 # 5. 单循环 -> 循环级特征
 # ============================================================
 def extract_cycle_features(df, cycle_num, ref_capacity):
+    """
+    单放电循环 -> 统一 14 维循环级特征
+
+    与 XJTU_processing.py / 论文 Table 1 完全同名、同序：
+      - 充电阶段 7 维 (CC 4 + CV 3): NASA 无对应工况记录 -> 零填充
+      - 放电阶段 7 维: 由放电段的 V / I / t 积分与统计得到
+
+    单位约定: time_s 为秒，积分时除以 3600 转为 h，
+             故 ∫V·|I| dt -> Wh, ∫|I| dt -> Ah
+    """
     if len(df) < MIN_POINTS_PER_CYCLE:
         return None
 
-    t = df["time_s"].values.astype(np.float64)
-    v = df["voltage_V"].values.astype(np.float64)
-    i = df["current_A"].values.astype(np.float64)
+    t    = df["time_s"].values.astype(np.float64)
+    v    = df["voltage_V"].values.astype(np.float64)
+    i    = df["current_A"].values.astype(np.float64)
     temp = df["temperature_C"].values.astype(np.float64)
-    soc = df["soc"].values.astype(np.float64)
-    cap = float(df["capacity_Ah"].iloc[0])
+    cap  = float(df["capacity_Ah"].iloc[0])
 
-    t_rel = t - t[0]
-    duration = float(t_rel[-1]) if len(t_rel) > 0 else 0.0
-    duration = max(duration, 1e-6)
+    i_abs = np.abs(i)
+    dt_h  = (t - t[0]) / 3600.0            # s -> h
+    dt_h  = np.clip(dt_h, 0.0, None)
 
     feats = {}
 
-    # 基本信息
-    feats["cycle_num"] = cycle_num
-    feats["cycle_index"] = int(df["cycle_index"].iloc[0])
-    feats["capacity_Ah"] = cap
-    feats["discharge_duration"] = duration
+    # ── 充电阶段 7 维: 无记录, 零填充 ────────────────────────
+    feats.update(empty_charge_features())
 
-    # 电压特征
-    feats["v_start"] = float(v[0])
-    feats["v_end"] = float(v[-1])
-    feats["v_mean"] = float(np.mean(v))
-    feats["v_std"] = float(np.std(v))
-    feats["v_min"] = float(np.min(v))
-    feats["v_max"] = float(np.max(v))
-    feats["v_range"] = float(v[0] - v[-1])
+    # ── 放电阶段 7 维 ────────────────────────────────────────
+    feats["Q_dis"]      = float(np.trapz(i_abs, dt_h))          # Ah
+    feats["E_dis"]      = float(np.trapz(v * i_abs, dt_h))      # Wh
+    feats["I_dis_mean"] = float(np.mean(i_abs))                 # A
+    feats["V_dis_mean"] = float(np.mean(v))                     # V
+    feats["V_dis_min"]  = float(np.min(v))                      # V
+    feats["V_dis_std"]  = float(np.std(v))                      # V
 
-    n = len(v)
-    n30 = max(int(n * 0.3), 2)
-    feats["v_slope_early"] = safe_linregress(t_rel[:n30], v[:n30])
-    feats["v_slope_late"] = safe_linregress(t_rel[-n30:], v[-n30:])
+    # 放电电压衰减斜率 [V/step]: 对归一化时间轴做一阶线性拟合
+    if len(v) > 5:
+        x = np.linspace(0.0, 1.0, len(v))
+        feats["k_V_dis"] = float(np.polyfit(x, v, 1)[0])
+    else:
+        feats["k_V_dis"] = 0.0
 
-    feats["v_at_soc80"] = interp_y_at_x(soc, v, 0.8)
-    feats["v_at_soc50"] = interp_y_at_x(soc, v, 0.5)
-    feats["v_at_soc20"] = interp_y_at_x(soc, v, 0.2)
-
-    # 电流特征
-    feats["i_mean_abs"] = float(np.mean(np.abs(i)))
-    feats["i_std"] = float(np.std(i))
-    feats["i_min"] = float(np.min(i))
-    feats["i_max"] = float(np.max(i))
-
-    # 温度特征
-    feats["t_start"] = float(temp[0])
-    feats["t_end"] = float(temp[-1])
-    feats["t_max"] = float(np.max(temp))
-    feats["t_mean"] = float(np.mean(temp))
-    feats["t_std"] = float(np.std(temp))
-    feats["t_rise"] = float(np.max(temp) - temp[0])
-
-    # SOC特征
-    feats["soc_start"] = float(soc[0])
-    feats["soc_end"] = float(soc[-1])
-    feats["soc_range"] = float(soc[0] - soc[-1])
-    feats["time_to_soc50"] = interp_y_at_x(soc, t_rel, 0.5)
-
-    # 能量 / 功率近似
-    dt = np.diff(t_rel, prepend=0.0)
-    dt = np.clip(dt, 0, None)
-    energy_ws = np.sum(v * np.abs(i) * dt)
-    feats["energy_Wh"] = float(energy_ws / 3600.0)
-    feats["avg_power_W"] = float(energy_ws / duration)
-
-    # 简单内阻 proxy
-    feats["v_drop_per_A"] = float((v[0] - v[-1]) / (np.mean(np.abs(i)) + 1e-6))
-
-    # 老化目标
-    feats["Target_SOH"] = float(cap / ref_capacity)
-    feats["Target_T_max"] = float(np.max(temp))
+    # ── 老化 / 温度目标 ──────────────────────────────────────
+    feats["Target_SOH"]    = float(cap / ref_capacity)
+    feats["Target_T_max"]  = float(np.max(temp))
     feats["Target_T_mean"] = float(np.mean(temp))
     feats["Target_T_rise"] = float(np.max(temp) - temp[0])
 
-    # 对标你原始代码字段
     feats["cycle_count"] = cycle_num
 
     return feats
@@ -315,16 +298,17 @@ def build_battery_feature_table(battery_name, raw_dir):
         print(f"  [WARN] {battery_name}: no feature rows extracted")
         return None
 
-    feat_df = pd.DataFrame(rows).sort_values("cycle_num").reset_index(drop=True)
+    feat_df = pd.DataFrame(rows).sort_values("cycle_count").reset_index(drop=True)
 
-    # 衍生特征
-    feat_df["capacity_fade_rate"] = feat_df["capacity_Ah"].diff().fillna(0.0)
-    feat_df["capacity_fade_pct"] = feat_df["capacity_Ah"] / ref_capacity
-    feat_df["cycle_ratio"] = np.arange(len(feat_df)) / max(len(feat_df) - 1, 1)
-
-    for col in ["capacity_Ah", "t_max", "t_mean", "v_mean", "energy_Wh"]:
-        feat_df[f"prev_{col}"] = feat_df[col].shift(1).bfill()
-        feat_df[f"delta_{col}"] = feat_df[col].diff().fillna(0.0)
+    # ── 统一特征表: 严格保留 14 维并按 Table 1 顺序排列 ──────
+    target_cols = ["Target_SOH", "Target_T_max",
+                   "Target_T_mean", "Target_T_rise"]
+    ordered = (["battery_id", "cycle_count"]
+               + check_feature_order(
+                   [c for c in feat_df.columns
+                    if c not in ["battery_id", "cycle_count"] + target_cols])
+               + target_cols)
+    feat_df = feat_df[ordered]
 
     # 数值清洗
     num_cols = feat_df.select_dtypes(include=[np.number]).columns
@@ -378,29 +362,33 @@ def preprocess_all(raw_dir=RAW_DATA_DIR, out_dir=OUT_FEATURE_DIR, batteries=BATT
             "3) scipy.io.loadmat 能否正常读取这些文件。"
         )
 
-    # 打印特征列1
+    # 统一特征列校验与打印
     sample = next(iter(all_dfs.values()))
-    exclude_cols = {
-        "battery_id", "cycle_count", "cycle_num", "cycle_index",
-        "Target_SOH", "Target_T_max", "Target_T_mean", "Target_T_rise"
-    }
-    feat_cols = [c for c in sample.columns if c not in exclude_cols]
+    target_cols = {"Target_SOH", "Target_T_max",
+                   "Target_T_mean", "Target_T_rise"}
+    feat_cols = check_feature_order(
+        [c for c in sample.columns
+         if c not in {"battery_id", "cycle_count"} | target_cols]
+    )
 
-    print(f"\nFeature columns ({len(feat_cols)} dims):")
+    print(f"\nFeature columns ({len(feat_cols)} dims, "
+          f"must equal {N_FEATURES}):")
     for c in feat_cols:
-        print(" ", c)
+        tag = "zero-padded" if c in CHARGE_FEATURES else "measured"
+        print(f"  {c:12s} [{FEATURE_UNITS.get(c, '-'):6s}]  <- {tag}")
 
     # 保存一个总览表
     overview = []
     for bat, df in all_dfs.items():
-        overview.append({
+        row = {
             "battery": bat,
             "n_cycles": len(df),
             "soh_start": float(df["Target_SOH"].iloc[0]),
             "soh_end": float(df["Target_SOH"].iloc[-1]),
-            "cap_start": float(df["capacity_Ah"].iloc[0]),
-            "cap_end": float(df["capacity_Ah"].iloc[-1]),
-        })
+        }
+        for c in ("I_dis_mean", "V_dis_mean", "Q_dis", "E_dis"):
+            row[c] = float(df[c].mean()) if c in df.columns else np.nan
+        overview.append(row)
     overview_df = pd.DataFrame(overview)
     overview_csv = os.path.join(out_dir, "battery_overview.csv")
     overview_df.to_csv(overview_csv, index=False)
